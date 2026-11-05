@@ -13,8 +13,7 @@ class Computer_Vision:
         self.VERDE_ALTO = np.array ([90,255,255])
     
     def mask(self, raw_frame, min_green_pixels=700):
-        # VideoCapture already returns BGR. Keep the camera frame's native size
-        # so mask/contour coordinates match the image being annotated.
+
         conversion_a_HSV = cv2.cvtColor(raw_frame, cv2.COLOR_BGR2HSV)
         GaussianBlur = cv2.GaussianBlur(conversion_a_HSV, (5, 5), 0)
 
@@ -23,8 +22,6 @@ class Computer_Vision:
         bg_closed_mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, self.kernel)
         bg_closed_mask = cv2.morphologyEx(bg_closed_mask, cv2.MORPH_CLOSE, self.kernel)
 
-        # raw_frame is already the requested ROI, so an all-white mask would
-        # leave the threshold image unchanged.
         search_mask = bg_closed_mask
         verde_pixeles = cv2.countNonZero(search_mask)
         contours, _ = cv2.findContours(search_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -37,9 +34,7 @@ class Computer_Vision:
             Largest_contour = max(contours, key=cv2.contourArea)
             rectangle = cv2.minAreaRect(Largest_contour)
             center, (rect_width, rect_height), rect_angle = rectangle
-            # Convert OpenCV's rectangle angle into the detected shape's long
-            # axis angle, then express its signed error from vertical. The line
-            # is considered vertical at either -90 or +90 degrees.
+
             long_axis_angle = rect_angle
             if rect_height > rect_width:
                 long_axis_angle += 90
