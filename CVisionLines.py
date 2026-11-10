@@ -34,7 +34,6 @@ class Computer_Vision:
             Largest_contour = max(contours, key=cv2.contourArea)
             rectangle = cv2.minAreaRect(Largest_contour)
             center, (rect_width, rect_height), rect_angle = rectangle
-
             long_axis_angle = rect_angle
             if rect_height > rect_width:
                 long_axis_angle += 90
