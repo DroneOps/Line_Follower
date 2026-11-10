@@ -1,111 +1,140 @@
-import CVisionLines
-from djitellopy import Tello
+import time
+import numpy as np
 import cv2
+from djitellopy import Tello
+import CVisionLines
 from O_Algo import create_ui
 import pyvisual as pv
 from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QApplication
-ancho_linea = 10
-LOOKAHEAD_YAW_STOP_PIXELS = 1200
+
+# Umbrales calibrados para ventana lookahead de 85x110 px
+LOOKAHEAD_START_TURN_PIXELS = 220   # Si baja de esto, inicia maniobra de esquina
+LOOKAHEAD_STOP_TURN_PIXELS = 320    # Píxeles necesarios en el frente para confirmar los 90°
+MIN_TURN_DURATION = 0.45            # Segundos mínimos girando para no re-enganchar la línea vieja
+MAX_TURN_DURATION = 2.40            # Tiempo máximo de seguridad para evitar giros de 180°
+
 
 class dron:
     def __init__(self):
         self.tello = Tello()
         self.tello.connect()
         self.tello.streamon()
-        print(f"conectado, 电池: {self.tello.get_battery()}%")
+        print(f"Conectado, Batería: {self.tello.get_battery()}%")
         self.computerVision = CVisionLines.Computer_Vision()
 
+        # Ganancias suaves para evitar sobreimpulso lateral
+        self.kpx = 0.33
+        self.kix = 0.20
+        self.kdx = 0.30
+
+        self.kp_yaw = 0.70
+        self.kd_yaw = 0.10
+
         self.integral_x = 0.0
-        self.integral_y = 0.0
-        self.limite = 30.0
+        self.prev_err_x = 0.0
+        self.prev_err_yaw = 0.0
+        self.last_time = time.time()
+        self.limite = 20.0
 
-        self.velocidad = 35
-    
+        # Velocidad crucero reducida para dar tiempo de reacción en curvas
+        self.velocidad = 40
+        self.min_velocidad = 8
+        self.deadband_pixels = 6
+        self.deadband_angle = 4.0
 
-        self.kpy = 0.3
-        self.kiy = 0.15
-
-        self.kpx = 0.45
-        self.kix = 0.07
-        self.dt = 0.1
-
-        self.deadband_pixels = 4
+        # Máquina de estados para curvas
         self.searching_for_line = False
-        self.search_centering_before_yaw = False
         self.search_yaw = 0
-        self.search_yaw_stopped = False
-        self.deceleration_kp = 100.0
-        self.approach_stop_latched = False
-        self.gap_search_speed = 40
+        self.turn_Yaw_speed = 32
+        self.last_turn_hint = 0      # -1: Izquierda, +1: Derecha
+        self.brake_frames = 0        # Contador para pulso de frenado inverso
+        self.turn_start_time = 0.0
 
         self.seen_frame = self.tello.get_frame_read()
 
-    def scale_signal(self, val, min_power=8):
-        """Maps control values past Tello RC deadband."""
+    def scale_signal(self, val, min_power=8, max_power=35):
         if val == 0:
             return 0
         sign = 1 if val > 0 else -1
         magnitude = abs(val)
         if magnitude < min_power:
             return sign * min_power
-        return sign * min(100, magnitude)
+        return sign * min(max_power, magnitude)
 
     def mirar(self):
         frame = self.seen_frame.frame
         if frame is None or frame.size == 0:
             return None
+
         vdd_frame = cv2.resize(frame, (480, 360))
         flip_frame = cv2.flip(vdd_frame, 0)
-        vrai_frame = flip_frame[0:360, 90:390]
-        half_frame = flip_frame[0:185, 110:370]
-        lookahead_frame = half_frame[0:30, 87:153]
 
-        half_frame_area = half_frame.shape[0] * half_frame.shape[1]
-        lookahead_area = lookahead_frame.shape[0] * lookahead_frame.shape[1]
-        lookahead_min_green = max(1, round(700 * lookahead_area / half_frame_area))
-        centro_x, centro_y, center, search_mask, width, _, _ = self.computerVision.mask(vrai_frame)
-        _, _, half_center, half_mask, half_line_width, _, _ = self.computerVision.mask(half_frame)
-        _, _, _, lookahead_mask, _, lookahead_pixels, _ = self.computerVision.mask(
-            lookahead_frame, min_green_pixels=lookahead_min_green
-        )
+        # Recorte maestro de 300x360
+        vrai_frame = flip_frame[0:360, 90:390]
+        centro_x, centro_y, center, search_mask, width, _, vertical_error = self.computerVision.mask(vrai_frame)
+
+        # Mitad superior (0:185) y ventana Lookahead frontal (0:85, 95:205 -> 85x110 px)
+        half_mask = search_mask[0:185, :]
+        lookahead_mask = search_mask[0:85, 95:205]
+        lookahead_pixels = cv2.countNonZero(lookahead_mask)
+        lookahead_min_green = 1100
+
+        # Detectar hacia qué lado se carga la línea en la mitad superior (para anticipar la esquina)
+        left_half_pixels = cv2.countNonZero(half_mask[:, 0:135])
+        right_half_pixels = cv2.countNonZero(half_mask[:, 165:300])
+
+        if left_half_pixels > right_half_pixels + 250 or (vertical_error is not None and vertical_error < -14):
+            self.last_turn_hint = -1
+        elif right_half_pixels > left_half_pixels + 250 or (vertical_error is not None and vertical_error > 14):
+            self.last_turn_hint = 1
+
+        M_half = cv2.moments(half_mask)
+        if M_half["m00"] > 250:
+            half_center = (M_half["m10"] / M_half["m00"], M_half["m01"] / M_half["m00"])
+        else:
+            half_center = None
+
         return (
             flip_frame, centro_x, centro_y, center, width, search_mask,
-            half_mask, half_center, half_line_width, lookahead_mask,
-            lookahead_pixels, lookahead_min_green,
+            half_mask, half_center, vertical_error, lookahead_mask,
+            lookahead_pixels, lookahead_min_green, left_half_pixels, right_half_pixels
         )
 
+    def controller(self, center, centro_x, vertical_error=0.0):
+        now = time.time()
+        dt = max(0.01, min(0.1, now - self.last_time))
+        self.last_time = now
 
-    def controller(self, center, centro_x, centro_y, width):
-        if center is not None and width is not None and width > 0:
-            error_x_pixels = center[0] - centro_x
-            error_y_pixels = centro_y - center[1]
-            
-            error_x = error_x_pixels * (ancho_linea / width)
-            error_y = error_y_pixels * (ancho_linea / width)
+        if center is not None:
+            error_x = float(center[0] - centro_x)
 
-            if abs(error_x_pixels) <= self.deadband_pixels:
+            if abs(error_x) <= self.deadband_pixels:
                 error_x = 0.0
                 self.integral_x = 0.0
-            if abs(error_y_pixels) <= self.deadband_pixels:
-                error_y = 0.0
-                self.integral_y = 0.0
 
-            self.integral_x += error_x * self.dt
-            self.integral_y += error_y * self.dt
+            self.integral_x = float(np.clip(self.integral_x + error_x * dt, -self.limite, self.limite))
+            deriv_x = (error_x - self.prev_err_x) / dt
+            self.prev_err_x = error_x
 
-            self.integral_x = max(min(self.integral_x, self.limite), - self.limite)
-            self.integral_y = max(min(self.integral_y, self.limite), - self.limite)
-            
-            raw_roll = int((self.kpx * error_x) + (self.kix * self.integral_x))
-            raw_pitch = int((self.kpy * error_y) + (self.kiy * self.integral_y))
+            raw_roll = int((self.kpx * error_x) + (self.kix * self.integral_x) + (self.kdx * deriv_x))
+            true_roll = self.scale_signal(raw_roll, min_power=7, max_power=25)
 
-            true_roll = self.scale_signal(raw_roll)
-            true_pitch = self.scale_signal(raw_pitch)
+            true_yaw = 0
+            if vertical_error is not None and abs(vertical_error) > self.deadband_angle:
+                deriv_yaw = (vertical_error - self.prev_err_yaw) / dt
+                self.prev_err_yaw = vertical_error
+                raw_yaw = int((self.kp_yaw * vertical_error) + (self.kd_yaw * deriv_yaw))
+                true_yaw = self.scale_signal(raw_yaw, min_power=6, max_power=25)
+            else:
+                self.prev_err_yaw = 0.0
 
-            return true_roll, true_pitch, error_x, error_y
-        else:
-            return 0, 0, 0, 0
+            return true_roll, true_yaw, error_x
+
+        self.prev_err_x = 0.0
+        self.prev_err_yaw = 0.0
+        return 0, 0, 0.0
+
     def takeoff(self):
         self.tello.takeoff()
 
@@ -114,7 +143,7 @@ class dron:
             self.tello.send_rc_control(0, 0, 0, 0)
             self.tello.land()
         except Exception as e:
-            print(f"no se pudo bajar ff gg papa :{e}")
+            print(f"Error al aterrizar: {e}")
 
     def controlador(self, lr_speed, fb_speed, ud_speed, yaw_speed):
         lr = max(-100, min(100, int(lr_speed)))
@@ -123,38 +152,23 @@ class dron:
         yaw = max(-100, min(100, int(yaw_speed)))
         self.tello.send_rc_control(lr, fb, ud, yaw)
 
-
-
     def reset_search(self):
         self.searching_for_line = False
-        self.search_centering_before_yaw = False
         self.search_yaw = 0
-        self.search_yaw_stopped = False
+        self.brake_frames = 0
+        self.integral_x = 0.0
+        self.prev_err_x = 0.0
+        self.prev_err_yaw = 0.0
 
-    def update_approach_speed(self, lookahead_pixels, lookahead_min_green, half_frame_visible):
-        #if not half_frame_visible:
-           # self.approach_stop_latched = False
-           # return 0
-
-        #if self.approach_stop_latched:
-          #  return 0
-
+    def update_approach_speed(self, lookahead_pixels, lookahead_min_green, err_x):
+        if lookahead_pixels < LOOKAHEAD_START_TURN_PIXELS:
+            return 0
         coverage = max(0.0, min(1.0, lookahead_pixels / max(1, lookahead_min_green)))
-        missing_fraction = 1.0 - coverage
-        desired_speed = max(
-            0.0,
-            min(
-                float(self.velocidad),
-                float(self.velocidad) - max(0.0, self.deceleration_kp) * missing_fraction,
-            ),
-        )
-        command = int(round(desired_speed))
-        if command == 0:
-            self.approach_stop_latched = True
-
-        return command
-
-
+        speed = self.min_velocidad + (self.velocidad - self.min_velocidad) * coverage
+        # Reducir velocidad de avance si el dron está muy descentrado lateralmente
+        if abs(err_x) > 35:
+            speed = min(speed, float(self.min_velocidad))
+        return int(round(speed))
 
 
 def button_clicked(ui, obj, timer):
@@ -163,12 +177,12 @@ def button_clicked(ui, obj, timer):
         obj.tello.send_rc_control(0, 0, 0, 0)
         obj.land()
     except Exception as e:
-        print(f"no se pudo gg ff papa {e}")
+        print(f"Error al detener: {e}")
     finally:
         try:
             obj.tello.end()
         except Exception as e:
-            print(f"no se pudo cerrar el stream gg ff papa: {e}")
+            print(f"Error al cerrar stream: {e}")
         ui["window"].close()
         app = QApplication.instance()
         if app is not None:
@@ -178,17 +192,10 @@ def button_clicked(ui, obj, timer):
 def binding(timer, ui, obj):
     ui['page_0']['Button_2'].on_click = lambda *args: button_clicked(ui, obj, timer)
 
+
 def UIimage(ui, frame, masc):
     ui['page_0']['OpencvImage_11'].image = masc
     ui['page_0']['OpencvImage_10'].image = frame
-
-
-
-
-
-
-
-
 
 
 def update_camera(obj):
@@ -198,135 +205,74 @@ def update_camera(obj):
 
     (
         flip_frame, centro_x, centro_y, center, width, mascara,
-        half_masc, half_center, half_line_width, lookahead_mask,
-        lookahead_pixels, lookahead_min_green,
+        half_masc, half_center, vertical_error, lookahead_mask,
+        lookahead_pixels, lookahead_min_green, left_px, right_px
     ) = result
-    true_roll, true_pitch, err_x, err_y = obj.controller(center, centro_x, centro_y, width)
+
+    true_roll, true_yaw, err_x = obj.controller(center, centro_x, vertical_error)
+
+    # Renderizado de HUD
     img = cv2.cvtColor(flip_frame, cv2.COLOR_RGB2BGR)
-    cv2.putText(img, f"Error X: {err_x:.1f}", (8, 122), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
+    dir_txt = "IZQ" if obj.last_turn_hint < 0 else ("DER" if obj.last_turn_hint > 0 else "RECTO")
+    cv2.putText(img, f"ErrX:{err_x:.0f} | Curva:{dir_txt}", (8, 122),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
+
     display = cv2.cvtColor(mascara.copy(), cv2.COLOR_GRAY2BGR)
-    x0 = 140 - 90
-    x1 = 340 - 90
-    y0, y1 = 0, 165
+    cv2.rectangle(display, (50, 0), (249, 184), (0, 255, 255), 2)
+    cv2.rectangle(display, (95, 0), (204, 84), (255, 255, 0), 2)
+    cv2.putText(display, f"LOOK: {lookahead_pixels}", (98, 16),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.38, (255, 255, 0), 1)
+    cv2.line(display, (135, 0), (135, 184), (255, 0, 255), 1)
+    cv2.line(display, (165, 0), (165, 184), (255, 0, 255), 1)
 
-    cv2.rectangle(display, (x0, y0), (x1 - 1, y1 - 1), (0, 255, 255), 2)
-
-    lookahead_height, lookahead_width = lookahead_mask.shape[:2]
-    lookahead_x0 = x0 + (200 - lookahead_width) // 2
-    display[y0:y0 + lookahead_height, lookahead_x0:lookahead_x0 + lookahead_width] = cv2.cvtColor(
-        lookahead_mask, cv2.COLOR_GRAY2BGR
-    )
-    cv2.rectangle(
-        display,
-        (lookahead_x0, y0),
-        (lookahead_x0 + lookahead_width - 1, y0 + lookahead_height - 1),
-        (255, 255, 0),
-        2,
-    )
-    cv2.putText(
-        display,
-        f"LOOKAHEAD: {lookahead_pixels}",
-        (lookahead_x0 + 4, y0 + 14),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.35,
-        (255, 255, 0),
-        1,
-    )
-
-    x_first_divider = x0 + round((x1 - x0) / 3)
-    x_second_divider = x0 + round(2 * (x1 - x0) / 3)
-    cv2.line(display, (x_first_divider, y0), (x_first_divider, y1 - 1), (255, 0, 255), 1)
-    cv2.line(display, (x_second_divider, y0), (x_second_divider, y1 - 1), (255, 0, 255), 1)
-
-    y_mid = y0 + (y1 - y0) // 2
-    cv2.line(display, (x0, y_mid), (x1 - 1, y_mid), (255, 0, 255), 1)
     UIimage(ui, img, display)
 
-
-
-
-    forward_speed = obj.update_approach_speed(
-        lookahead_pixels,
-        lookahead_min_green,
-        half_center is not None,
-    )
-
-    left_zone_end = x0 + round((x1 - x0) / 3)
-    right_zone_start = x0 + round(2 * (x1 - x0) / 3)
-
-
-    if not obj.searching_for_line and lookahead_pixels < LOOKAHEAD_YAW_STOP_PIXELS:
-        if center is not None and center[0] < left_zone_end:
-            obj.searching_for_line = True
-            obj.search_centering_before_yaw = True
-            obj.search_yaw = -60
-            obj.search_yaw_stopped = False
-        elif center is not None and center[0] > right_zone_start:
-            obj.searching_for_line = True
-            obj.search_centering_before_yaw = True
-            obj.search_yaw = 60
-            obj.search_yaw_stopped = False
-
-    #""" if not obj.searching_for_line and center is not None:
-     #   obj.searching_for_line = True
-     #   obj.search_yaw = 0
-      #  obj.search_yaw_stopped = False
-       # if center[0] < left_zone_end:
-      #      obj.search_yaw = -20
-       # elif center[0] > right_zone_start:
-       #     obj.search_yaw = 20"""
-
-
-
-    if obj.searching_for_line and obj.search_centering_before_yaw:
-        if half_center is not None and half_line_width is not None and half_line_width > 0:
-            half_frame_center_x = half_masc.shape[1] / 2
-            half_frame_center_y = (half_masc.shape[0] / 2) + 20
-            half_roll, half_pitch, _, _ = obj.controller(
-                half_center,
-                half_frame_center_x,
-                half_frame_center_y,
-                half_line_width,
-            )
-            middle_third_left = half_masc.shape[1] / 3
-            middle_third_right = 2 * half_masc.shape[1] / 3
-            line_is_in_middle_third = middle_third_left <= half_center[0] <= middle_third_right
-            line_is_near_vertical_center = abs(half_center[1] - half_frame_center_y) <= 15
-
-            if line_is_near_vertical_center:
-                    obj.controlador(0, 0, 0, obj.search_yaw)
-                    return
-            else:
-                obj.controlador(0, half_pitch, 0, 0)
-                return
+    # 1. DETECCIÓN DE ENTRADA A ESQUINA (Se acaba la línea en la ventana frontal)
+    if not obj.searching_for_line and lookahead_pixels < LOOKAHEAD_START_TURN_PIXELS and center is not None:
+        # Decidir sentido de giro usando los píxeles de los flancos o la memoria inmediata
+        if left_px > right_px + 120:
+            turn_dir = -1
+        elif right_px > left_px + 120:
+            turn_dir = 1
+        elif obj.last_turn_hint != 0:
+            turn_dir = obj.last_turn_hint
         else:
+            turn_dir = -1 if center[0] < centro_x else 1
 
-            obj.search_centering_before_yaw = False
-    
-    if obj.searching_for_line and not obj.search_centering_before_yaw:
-        if lookahead_pixels >= LOOKAHEAD_YAW_STOP_PIXELS:
-            obj.search_yaw = 0
-            obj.search_yaw_stopped = True
-        elif obj.search_yaw != 0:
-            obj.controlador(0, 0, 0, obj.search_yaw)
+        obj.searching_for_line = True
+        obj.search_yaw = turn_dir * obj.turn_Yaw_speed
+        obj.brake_frames = 5  # ~0.16s de pulso inverso para frenar la inercia
+        obj.turn_start_time = time.time()
+
+    # 2. EJECUCIÓN DE LA VUELTA EN ESQUINA
+    if obj.searching_for_line:
+        # Paso A: Pulso corto de frenado en seco para no pasarse del vértice
+        if obj.brake_frames > 0:
+            obj.brake_frames -= 1
+            obj.controlador(0, -12, 0, 0)
             return
 
+        elapsed_turn = time.time() - obj.turn_start_time
 
-    if obj.search_yaw_stopped or lookahead_pixels >= LOOKAHEAD_YAW_STOP_PIXELS:
-        if half_center is not None and lookahead_pixels != 0:
-            obj.reset_search()
-            obj.approach_stop_latched = False
-            obj.controlador(true_roll, forward_speed, 0, 0)
-        else:
-            obj.controlador(0, 0, 0, 0)
+        # Paso B: Después del tiempo mínimo de despeje (0.45s), buscar la nueva línea a 90°
+        line_centered_ahead = (
+            half_center is not None and 95 <= half_center[0] <= 205
+        )
+        if elapsed_turn >= MIN_TURN_DURATION:
+            if (lookahead_pixels >= LOOKAHEAD_STOP_TURN_PIXELS and line_centered_ahead) or elapsed_turn > MAX_TURN_DURATION:
+                obj.reset_search()
+                obj.controlador(0, 0, 0, 0)
+                return
+
+        # Mantener giro puro sobre el eje sin retroceder
+        obj.controlador(0, 0, 0, obj.search_yaw)
         return
 
+    # 3. SEGUIMIENTO NORMAL EN RECTA / CURVA SUAVE
+    forward_speed = obj.update_approach_speed(lookahead_pixels, lookahead_min_green, err_x)
 
-
-    if obj.search_yaw != 0 and not obj.search_centering_before_yaw:
-        obj.controlador(0 , 0, 0, obj.search_yaw)
-    elif center is not None and lookahead_pixels != 0 or lookahead_pixels > LOOKAHEAD_YAW_STOP_PIXELS:
-        obj.controlador(true_roll, forward_speed, 0, 0)
+    if center is not None:
+        obj.controlador(true_roll, forward_speed, 0, true_yaw)
     else:
         obj.controlador(0, 0, 0, 0)
 
